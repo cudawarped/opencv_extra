@@ -2,8 +2,11 @@
 
 from __future__ import print_function
 import hashlib
+import os
 import sys
 import tarfile
+import requests
+
 if sys.version_info[0] < 3:
     from urllib2 import urlopen
 else:
@@ -17,6 +20,7 @@ class Model:
     def __init__(self, **kwargs):
         self.name = kwargs.pop('name')
         self.url = kwargs.pop('url', None)
+        self.downloader = kwargs.pop('downloader', None)
         self.filename = kwargs.pop('filename')
         self.sha = kwargs.pop('sha', None)
         self.archive = kwargs.pop('archive', None)
@@ -39,47 +43,66 @@ class Model:
             return False
         print('  expect {}'.format(self.sha))
         sha = hashlib.sha1()
-        with open(self.filename, 'rb') as f:
-            while True:
-                buf = f.read(self.BUFSIZE)
-                if not buf:
-                    break
-                sha.update(buf)
-        print('  actual {}'.format(sha.hexdigest()))
-        return self.sha == sha.hexdigest()
-
-    def get(self):
         try:
-            if self.verify():
-                print('  hash match - skipping')
-                return True
+            with open(self.filename, 'rb') as f:
+                while True:
+                    buf = f.read(self.BUFSIZE)
+                    if not buf:
+                        break
+                    sha.update(buf)
+            print('  actual {}'.format(sha.hexdigest()))
+            self.sha_actual = sha.hexdigest()
+            return self.sha == self.sha_actual
         except Exception as e:
             print('  catch {}'.format(e))
+
+    def get(self):
+        if self.verify():
+            print('  hash match - skipping')
+            return True
+
+        basedir = os.path.dirname(self.filename)
+        if basedir and not os.path.exists(basedir):
+            print('  creating directory: ' + basedir)
+            os.makedirs(basedir, exist_ok=True)
 
         if self.archive or self.member:
             assert(self.archive and self.member)
             print('  hash check failed - extracting')
             print('  get {}'.format(self.member))
             self.extract()
-        else:
-            assert(self.url)
+        elif self.url:
             print('  hash check failed - downloading')
             print('  get {}'.format(self.url))
             self.download()
+        else:
+            assert self.downloader
+            print('  hash check failed - downloading')
+            sz = self.downloader(self.filename)
+            print('  size = %.2f Mb' % (sz / (1024.0 * 1024)))
 
         print(' done')
         print(' file {}'.format(self.filename))
-        return self.verify()
+        candidate_verify = self.verify()
+        if not candidate_verify:
+            self.handle_bad_download()
+        return candidate_verify
 
     def download(self):
-        r = urlopen(self.url)
-        self.printRequest(r)
-        self.save(r)
+        try:
+            r = urlopen(self.url, timeout=60)
+            self.printRequest(r)
+            self.save(r)
+        except Exception as e:
+            print('  catch {}'.format(e))
 
     def extract(self):
-        with tarfile.open(self.archive) as f:
-            assert self.member in f.getnames()
-            self.save(f.extractfile(self.member))
+        try:
+            with tarfile.open(self.archive) as f:
+                assert self.member in f.getnames()
+                self.save(f.extractfile(self.member))
+        except Exception as e:
+            print('  catch {}'.format(e))
 
     def save(self, r):
         with open(self.filename, 'wb') as f:
@@ -92,6 +115,67 @@ class Model:
                 f.write(buf)
                 print('>', end='')
                 sys.stdout.flush()
+
+    def handle_bad_download(self):
+        if os.path.exists(self.filename):
+            # rename file for further investigation
+            try:
+                # NB: using `self.sha_actual` may create unbounded number of files
+                rename_target = self.filename + '.invalid'
+                # TODO: use os.replace (Python 3.3+)
+                try:
+                    if os.path.exists(rename_target):  # avoid FileExistsError on Windows from os.rename()
+                        os.remove(rename_target)
+                finally:
+                    os.rename(self.filename, rename_target)
+                    print('  renaming invalid file to ' + rename_target)
+            except:
+                import traceback
+                traceback.print_exc()
+            finally:
+                if os.path.exists(self.filename):
+                    print('  deleting invalid file')
+                    os.remove(self.filename)
+
+
+def GDrive(gid):
+    def download_gdrive(dst):
+        session = requests.Session()  # re-use cookies
+
+        URL = "https://docs.google.com/uc?export=download"
+        response = session.get(URL, params = { 'id' : gid }, stream = True)
+
+        def get_confirm_token(response):  # in case of large files
+            for key, value in response.cookies.items():
+                if key.startswith('download_warning'):
+                    return value
+            return None
+        token = get_confirm_token(response)
+
+        if token:
+            params = { 'id' : gid, 'confirm' : token }
+            response = session.get(URL, params = params, stream = True)
+
+        BUFSIZE = 1024 * 1024
+        PROGRESS_SIZE = 10 * 1024 * 1024
+
+        sz = 0
+        progress_sz = PROGRESS_SIZE
+        with open(dst, "wb") as f:
+            for chunk in response.iter_content(BUFSIZE):
+                if not chunk:
+                    continue  # keep-alive
+
+                f.write(chunk)
+                sz += len(chunk)
+                if sz >= progress_sz:
+                    progress_sz += PROGRESS_SIZE
+                    print('>', end='')
+                    sys.stdout.flush()
+        print('')
+        return sz
+    return download_gdrive
+
 
 models = [
     Model(
@@ -507,6 +591,29 @@ models = [
         sha='40deb324ddba7db4117568e1e3911e7a771fb260',
         filename='onnx/data/output_resnet50v1.pb'),
     Model(
+        name='ResNet50-Int8 (ONNX)',
+        url='https://github.com/onnx/models/raw/master/vision/classification/resnet/model/resnet50-v1-12-int8.tar.gz',
+        sha='2ff2a58f4a27362ee6234915452e86287cdcf269',
+        filename='resnet50-v1-12-int8.tar.gz'),
+    Model(
+        name='ResNet50-Int8 (ONNX)',
+        archive='resnet50-v1-12-int8.tar.gz',
+        member='resnet50-v1-12-int8/resnet50-v1-12-int8.onnx',
+        sha='5fbeac70e1a3af3253c21e0e4008a784aa61929f',
+        filename='onnx/models/resnet50_int8.onnx'),
+    Model(
+        name='ResNet50-Int8 (ONNX)',
+        archive='resnet50-v1-12-int8.tar.gz',
+        member='resnet50-v1-12-int8/test_data_set_0/input_0.pb',
+        sha='0946521c8afcfea9340390298a41fb11496b3556',
+        filename='onnx/data/input_resnet50_int8.pb'),
+    Model(
+        name='ResNet50-Int8 (ONNX)',
+        archive='resnet50-v1-12-int8.tar.gz',
+        member='resnet50-v1-12-int8/test_data_set_0/output_0.pb',
+        sha='6d45d2f06150e9045631c7928093728b07c8b12d',
+        filename='onnx/data/output_resnet50_int8.pb'),
+    Model(
         name='ssd_mobilenet_v1_ppn_coco (TensorFlow)',
         url='http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_ppn_shared_box_predictor_300x300_coco14_sync_2018_07_03.tar.gz',
         sha='549ae0fd82c202786abe53c306b191c578599c44',
@@ -775,18 +882,185 @@ models = [
         url='https://www.dropbox.com/s/065l4vr8bptzohb/resnet-34_kinetics.onnx?dl=1',
         sha='88897629e4abb0fddef939f0c2d668a4edeb0788',
         filename='resnet-34_kinetics.onnx'),
+    Model(
+        name='Alexnet Facial Keypoints (ONNX)', # https://github.com/ismalakazel/Facial-Keypoint-Detection
+        url='https://drive.google.com/uc?export=dowload&id=1etGXT9WQK1KjDkJ0pUTH-CaHHva4p9cY',
+        sha='e1b82b56b59ab96b50189e1b39487d91d4fa0eea',
+        filename='onnx/models/facial_keypoints.onnx'),
+    Model(
+        name='LightWeight Human Pose Estimation (ONNX)', # https://github.com/Daniil-Osokin/lightweight-human-pose-estimation.pytorch
+        url='https://drive.google.com/uc?export=dowload&id=1--Ij_gIzCeNA488u5TA4FqWMMdxBqOji',
+        sha='5960f7aef233d75f8f4020be1fd911b2d93fbffc',
+        filename='onnx/models/lightweight_pose_estimation_201912.onnx'),
+    Model(
+        name='EfficientDet-D0', # https://github.com/google/automl
+        url='https://www.dropbox.com/s/9mqp99fd2tpuqn6/efficientdet-d0.pb?dl=1',
+        sha='f178cc17b44e3ed2f3956a0adc1800a7d2a3b3ae',
+        filename='efficientdet-d0.pb'),
+    Model(
+        name='YOLOv4',  # https://github.com/opencv/opencv/issues/17148
+        url="https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4.weights",
+        sha='0143deb6c46fcc7f74dd35bf3c14edc3784e99ee',
+        filename='yolov4.weights'),
+    Model(
+        name='YOLOv4-tiny-2020-12',  # https://github.com/opencv/opencv/issues/17148
+        url='https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.weights',
+        sha='451caaab22fb9831aa1a5ee9b5ba74a35ffa5dcb',
+        filename='yolov4-tiny-2020-12.weights'),
+    Model(
+        name='YOLOv4x-mish',  # https://github.com/opencv/opencv/issues/18975
+        url='https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4x-mish.weights',
+        sha='a6f2879af2241de2e9730d317a55db6afd0af00b',
+        filename='yolov4x-mish.weights'),
+    Model(
+        name='GSOC2016-GOTURN',  # https://github.com/opencv/opencv_contrib/issues/941
+        downloader=GDrive('1j4UTqVE4EGaUFiK7a5I_CYX7twO9c5br'),
+        sha='49776d262993c387542f84d9cd16566840404f26',
+        filename='gsoc2016-goturn/goturn.caffemodel'),
+    Model(
+        name='DaSiamRPM Tracker network (ONNX)',
+        url='https://www.dropbox.com/s/rr1lk9355vzolqv/dasiamrpn_model.onnx?dl=1',
+        sha='91b774fce7df4c0e4918469f0f482d9a27d0e2d4',
+        filename='onnx/models/dasiamrpn_model.onnx'),
+    Model(
+        name='DaSiamRPM Tracker kernel_r1 (ONNX)',
+        url='https://www.dropbox.com/s/999cqx5zrfi7w4p/dasiamrpn_kernel_r1.onnx?dl=1',
+        sha='bb64620a54348657133eb28be2d3a2a8c76b84b3',
+        filename='onnx/models/dasiamrpn_kernel_r1.onnx'),
+    Model(
+        name='DaSiamRPM Tracker kernel_cls1 (ONNX)',
+        url='https://www.dropbox.com/s/qvmtszx5h339a0w/dasiamrpn_kernel_cls1.onnx?dl=1',
+        sha='e9ccd270ce8059bdf7ed0d1845c03ef4a951ee0f',
+        filename='onnx/models/dasiamrpn_kernel_cls1.onnx'),
+    Model(
+        name='crnn',
+        url='https://drive.google.com/uc?export=dowload&id=1ooaLR-rkTl8jdpGy1DoQs0-X0lQsB6Fj',
+        sha='270d92c9ccb670ada2459a25977e8deeaf8380d3',
+        filename='onnx/models/crnn.onnx'),
+    Model(
+        name='DB_TD500_resnet50',
+        url='https://drive.google.com/uc?export=dowload&id=19YWhArrNccaoSza0CfkXlA8im4-lAGsR',
+        sha='1b4dd21a6baa5e3523156776970895bd3db6960a',
+        filename='onnx/models/DB_TD500_resnet50.onnx'),
+    Model(
+        name='YuNet',
+        url='https://github.com/ShiqiYu/libfacedetection.train/raw/1688402dbd9b9fc4a3a6793810f558b7407ff384/tasks/task1/onnx/yunet_120x160.onnx',
+        sha='dfe691ae0c8e38d39d1a437e3f7e5fda7b256bdd',
+        filename='onnx/models/yunet-202202.onnx'),
+    Model(
+        name='face_recognizer_fast',
+        url='https://drive.google.com/uc?export=dowload&id=1ClK9WiB492c5OZFKveF3XiHCejoOxINW',
+        sha='12ff8b1f5c8bff62e8dd91eabdacdfc998be255e',
+        filename='onnx/models/face_recognizer_fast.onnx'),
+    Model(
+        name='MobileNetv2 FP16 (ONNX)',
+        url='https://github.com/zihaomu/zihaomu/files/9393786/mobilenetv2_fp16_v7.tar.gz',
+        sha='018d42b1b1283e6025a0455deffe9f0e9930e839',
+        filename='mobilenetv2_fp16_v7.tar.gz'),
+    Model(
+        name='MobileNetv2 FP16 (ONNX)',
+        archive='mobilenetv2_fp16_v7.tar.gz',
+        member='mobilenetv2_fp16_v7/mobilenetv2_fp16.onnx',
+        sha='ab9352de8e07b798417922f23e97c8488bd50017',
+        filename='onnx/models/mobilenetv2_fp16.onnx'),
+    Model(
+        name='MobileNetv2 FP16 (ONNX)',
+        archive='mobilenetv2_fp16_v7.tar.gz',
+        member='mobilenetv2_fp16_v7/input_mobilenetv2_fp16.npy',
+        sha='cbb97c31abc07ff8c68f5028c634d79f8b83b560',
+        filename='onnx/data/input_mobilenetv2_fp16.npy'),
+    Model(
+        name='MobileNetv2 FP16 (ONNX)',
+        archive='mobilenetv2_fp16_v7.tar.gz',
+        member='mobilenetv2_fp16_v7/output_mobilenetv2_fp16.npy',
+        sha='397560616c47b847340cec9561e12a13b29ae32e',
+        filename='onnx/data/output_mobilenetv2_fp16.npy'),
+    Model(
+        name='wechat_qr_detect',
+        url='https://raw.githubusercontent.com/WeChatCV/opencv_3rdparty/wechat_qrcode/detect.prototxt',
+        sha='a6936962139282d300ebbf15a54c2aa94b144bb7',
+        filename='wechat_2021-01/detect.prototxt'),
+    Model(
+        name='wechat_qr_detect',
+        url='https://raw.githubusercontent.com/WeChatCV/opencv_3rdparty/wechat_qrcode/detect.caffemodel',
+        sha='d587623a055cbd58a648de62a8c703c7abb05f6d',
+        filename='wechat_2021-01/detect.caffemodel'),
+    Model(
+        name='wechat_super_resolution',
+        url='https://raw.githubusercontent.com/WeChatCV/opencv_3rdparty/wechat_qrcode/sr.prototxt',
+        sha='39e1f1031c842766f1cc126615fea8e8256facd2',
+        filename='wechat_2021-01/sr.prototxt'),
+    Model(
+        name='wechat_super_resolution',
+        url='https://raw.githubusercontent.com/WeChatCV/opencv_3rdparty/wechat_qrcode/sr.caffemodel',
+        sha='2b181b55d1d7af718eaca6cabdeb741217b64c73',
+        filename='wechat_2021-01/sr.caffemodel'),
+    Model(
+        name='yolov7_not_simplified',
+        downloader=GDrive('1rm3mIqjJNu0xPTCjMKnXccspazV1B2zv'),
+        sha='fcd0fa401c83bf2b29e18239a9c2c989c9b8669d',
+        filename='onnx/models/yolov7_not_simplified.onnx'),
+    Model(
+        name='NanoTrackV1 (ONNX)',
+        url='https://raw.githubusercontent.com/zihaomu/opencv_extra_data_backup/main/NanoTrack/models/nanotrack_backbone_sim.onnx',
+        sha='9b083a2dbe10dcfe17e694879aa6749302a5888f',
+        filename='onnx/models/nanotrack_backbone_sim.onnx'),
+    Model(
+        name='NanoTrackV1 (ONNX)',
+        url='https://raw.githubusercontent.com/zihaomu/opencv_extra_data_backup/main/NanoTrack/models/nanotrack_head_sim.onnx',
+        sha='8fa668893b27b726f9cab6695846b4690650a199',
+        filename='onnx/models/nanotrack_head_sim.onnx'),
+    Model(
+        name='NanoTrackV2 (ONNX)',
+        url='https://raw.githubusercontent.com/zihaomu/opencv_extra_data_backup/main/NanoTrackV2/models/nanotrack_backbone_sim_v2.onnx',
+        sha='6e773a364457b78574f9f63a23b0659ee8646f8f',
+        filename='onnx/models/nanotrack_backbone_sim_v2.onnx'),
+    Model(
+        name='NanoTrackV2 (ONNX)',
+        url='https://raw.githubusercontent.com/zihaomu/opencv_extra_data_backup/main/NanoTrackV2/models/nanotrack_head_sim_v2.onnx',
+        sha='39f168489671700cf739e402dfc67d41ce648aef',
+        filename='onnx/models/nanotrack_head_sim_v2.onnx'),
+    Model(
+        name='Face Mesh (TFLite)',
+        url='https://storage.googleapis.com/mediapipe-assets/face_landmark.tflite?generation=1668295060280094',
+        sha='eb01d1d88c833aaea64c880506da72e4a4f43154',
+        filename='tflite/face_landmark.tflite'),
+    Model(
+        name='Face Detection (TFLite)',
+        url='https://storage.googleapis.com/mediapipe-assets/face_detection_short_range.tflite?generation=1661875748538815',
+        sha='e8f749fafc23bb88daac85bc9f7e0698436f29a0',
+        filename='tflite/face_detection_short_range.tflite'),
+    Model(
+        name='Selfie Segmentation (TFLite)',
+        url='https://storage.googleapis.com/mediapipe-assets/selfie_segmentation.tflite?generation=1661875931201364',
+        sha='8d497f51bd678fa5fb95c3871be72eb5d722b831',
+        filename='tflite/selfie_segmentation.tflite'),
+    Model(
+        name='Hair Segmentation (TFLite)',
+        url='https://storage.googleapis.com/mediapipe-assets/hair_segmentation.tflite?generation=1661875756623461',
+        sha='bba28400dfc264b1ed7ee95df718fada1879644d',
+        filename='tflite/hair_segmentation.tflite'),
 ]
 
 # Note: models will be downloaded to current working directory
-#       expected working directory is opencv_extra/testdata/dnn
+#       expected working directory is <testdata>/dnn
 if __name__ == '__main__':
-    failedSums = []
+
+    selected_model_name = None
+    if len(sys.argv) > 1:
+        selected_model_name = sys.argv[1]
+        print('Model: ' + selected_model_name)
+
+    failedModels = []
     for m in models:
         print(m)
+        if selected_model_name is not None and not m.name.startswith(selected_model_name):
+            continue
         if not m.get():
-            failedSums.append(m.filename)
-    if failedSums:
-        print("Checksum verification failed for:")
-        for f in failedSums:
+            failedModels.append(m.filename)
+
+    if failedModels:
+        print("Following models have not been downloaded:")
+        for f in failedModels:
             print("* {}".format(f))
         exit(15)
